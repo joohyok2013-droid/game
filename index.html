@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#111418">
+<title>무전기</title>
+<style>
+:root{--bg:#111418;--card:#1c2128;--line:#2d333b;--tx:#e6edf3;--sub:#8b949e;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#2f81f7}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;overscroll-behavior:none}
+body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+.screen{height:100%;display:flex;flex-direction:column;padding:16px;max-width:520px;margin:0 auto}
+.hidden{display:none!important}
+#join{justify-content:center;align-items:center;text-align:center;gap:14px}
+#join h1{margin:0;font-size:32px}
+input{width:100%;padding:14px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--tx);font-size:17px;text-align:center}
+button{font:inherit;color:var(--tx);border:1px solid var(--line);background:var(--card);border-radius:12px;padding:12px;cursor:pointer}
+.primary{width:100%;background:var(--acc);border-color:var(--acc);font-weight:700;font-size:17px;padding:14px}
+.hint{color:var(--sub);font-size:13px;margin:0}
+header{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:14px}
+#status{display:flex;align-items:center;gap:6px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--warn)}
+.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}
+#users{list-style:none;margin:12px 0;padding:0;flex:1;overflow-y:auto}
+#users li{display:flex;align-items:center;gap:10px;padding:12px;margin-bottom:8px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+#users li.talk{border-color:var(--bad);box-shadow:0 0 0 1px var(--bad)}
+#users .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#users .tag{font-size:12px;color:var(--sub)}
+#users li.talk .tag{color:var(--bad);font-weight:700}
+#talker{text-align:center;color:var(--sub);min-height:24px;margin-bottom:8px}
+#talker.on{color:var(--bad);font-weight:700}
+#ptt{width:min(62vw,240px);height:min(62vw,240px);border-radius:50%;margin:0 auto 14px;display:block;font-size:20px;font-weight:700;background:#26303b;border:4px solid var(--acc);touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#ptt.on{background:var(--bad);border-color:#ffb3ad;transform:scale(.97)}
+#ptt:disabled{opacity:.4;border-color:var(--line)}
+.row{display:flex;gap:8px}.row button{flex:1;font-size:14px}
+.row button.active{background:var(--bad);border-color:var(--bad)}
+</style>
+</head>
+<body>
+
+<div id="join" class="screen">
+  <h1>📻 무전기</h1>
+  <p class="hint" id="roomLabel"></p>
+  <input id="nick" maxlength="12" placeholder="닉네임" autocomplete="off">
+  <button id="joinBtn" class="primary">입장하기</button>
+  <p class="hint">입장할 때 마이크 권한을 허용해 주세요.<br>하울링 방지를 위해 이어폰 사용을 권장합니다.</p>
+</div>
+
+<div id="main" class="screen hidden">
+  <header>
+    <div id="status"><span class="dot" id="dot"></span><span id="statusTx">연결 중…</span></div>
+    <div><span id="roomName"></span> · <span id="count">1</span>명 <button id="editNick" style="padding:4px 8px">✏️</button></div>
+  </header>
+  <ul id="users"></ul>
+  <div id="talker">조용함</div>
+  <button id="ptt" disabled>누르고 말하기</button>
+  <div class="row">
+    <button id="micBtn">🎤 마이크 켜짐</button>
+    <button id="spkBtn">🔊 스피커 켜짐</button>
+    <button id="leaveBtn">나가기</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+// ===== 설정 =====
+const ROOM = (location.hash.slice(1) || 'main').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'main';
+const DIR_ID = 'ptt-walkie-v1-' + ROOM + '-dir';   // 채널 안내용 고정 ID
+const ICE = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' }
+  // 연결이 안 되는 환경이 있으면 여기에 TURN 서버를 추가하세요 (안내 참고)
+  // , { urls: 'turn:서버주소:443', username: '아이디', credential: '비밀번호' }
+];
+const PEER_OPTS = { config: { iceServers: ICE } };
+
+// ===== 상태 =====
+const $ = id => document.getElementById(id);
+let main = null, dirPeer = null, dirConn = null, localStream = null, wakeLock = null;
+let me = { id: '', nick: '' }, left = true, micMuted = false, spkMuted = false, talking = false;
+const peers = new Map();       // id -> {id,nick,talking,conn,call,audio}
+const dirMembers = new Map();  // 안내 역할일 때만 사용
+
+$('roomLabel').textContent = '채널: ' + ROOM;
+$('roomName').textContent = '#' + ROOM;
+$('nick').value = localStorage.getItem('ptt-nick') || ('무전기' + Math.floor(1000 + Math.random() * 9000));
+
+// ===== 입장 / 퇴장 =====
+$('joinBtn').onclick = async () => {
+  const nick = $('nick').value.trim().slice(0, 12);
+  if (!nick) return $('nick').focus();
+  me.nick = nick;
+  try { localStorage.setItem('ptt-nick', nick); } catch (e) {}
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) {
+    return alert('마이크 권한이 필요합니다. 브라우저 설정에서 허용해 주세요.');
+  }
+  localStream.getAudioTracks()[0].enabled = false;   // 평소엔 무음
+  left = false;
+  $('join').classList.add('hidden');
+  $('main').classList.remove('hidden');
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  startPeer();
+  render();
+};
+
+function leave() {
+  left = true;
+  setTalking(false);
+  [...peers.keys()].forEach(removePeer);
+  [main, dirPeer].forEach(p => { try { p && p.destroy(); } catch (e) {} });
+  main = dirPeer = dirConn = null;
+  dirMembers.clear();
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  localStream = null;
+  try { wakeLock && wakeLock.release(); } catch (e) {}
+  $('main').classList.add('hidden');
+  $('join').classList.remove('hidden');
+}
+$('leaveBtn').onclick = leave;
+window.addEventListener('beforeunload', () => { try { main && main.destroy(); dirPeer && dirPeer.destroy(); } catch (e) {} });
+
+// ===== 시그널링 (PeerJS 무료 클라우드) =====
+function startPeer() {
+  main = new Peer(PEER_OPTS);
+  main.on('open', id => { me.id = id; joinDirectory(); render(); });
+  main.on('connection', conn => setupConn(conn));
+  main.on('call', call => { call.answer(localStream); setupCall(call); });
+  main.on('disconnected', () => { render(); if (!left) setTimeout(() => { try { main.reconnect(); } catch (e) {} }, 1000); });
+  main.on('error', e => {
+    if (e.type === 'peer-unavailable') {
+      if ((e.message || '').includes(DIR_ID)) claimDirectory();   // 안내 담당이 없으면 내가 맡는다
+      return;
+    }
+    console.warn('peer error', e.type, e.message);
+    render();
+  });
+}
+
+// 안내 담당(디렉터리): 새로 들어온 사람에게 기존 접속자 ID 목록을 알려주는 역할
+function joinDirectory() {
+  if (left || !main || !main.open) return;
+  const c = main.connect(DIR_ID, { reliable: true });
+  c.on('open', () => { dirConn = c; c.send({ t: 'hello' }); render(); });
+  c.on('data', d => { if (d && d.t === 'peers') d.ids.forEach(connectTo); });
+  c.on('close', () => {
+    if (dirConn === c) dirConn = null;
+    render();
+    if (!left) setTimeout(joinDirectory, 500 + Math.random() * 2000);
+  });
+}
+
+function claimDirectory() {
+  if (left || dirPeer) return;
+  const p = new Peer(DIR_ID, PEER_OPTS);
+  p.on('open', () => { dirPeer = p; setTimeout(joinDirectory, 200); });
+  p.on('connection', c => {
+    c.on('data', d => {
+      if (d && d.t === 'hello') {
+        const ids = [...dirMembers.keys()].filter(i => i !== c.peer);
+        dirMembers.set(c.peer, c);
+        c.send({ t: 'peers', ids });
+      }
+    });
+    c.on('close', () => dirMembers.delete(c.peer));
+  });
+  p.on('error', e => {
+    if (e.type === 'unavailable-id') {          // 방금 다른 사람이 먼저 맡음
+      try { p.destroy(); } catch (x) {}
+      setTimeout(joinDirectory, 500 + Math.random() * 1500);
+    }
+  });
+  p.on('disconnected', () => { try { p.reconnect(); } catch (e) {} });
+  p.on('close', () => { if (dirPeer === p) dirPeer = null; });
+}
+
+// ===== 상대방과 연결 (P2P 메시) =====
+function getPeer(id) {
+  if (!peers.has(id)) peers.set(id, { id, nick: '…', talking: false, conn: null, call: null, audio: null });
+  return peers.get(id);
+}
+
+function connectTo(id) {
+  if (left || id === me.id || peers.has(id)) return;
+  setupConn(main.connect(id, { reliable: true }));
+  setupCall(main.call(id, localStream));
+}
+
+function setupConn(conn) {
+  const p = getPeer(conn.peer);
+  p.conn = conn;
+  conn.on('open', () => { conn.send({ t: 'meta', nick: me.nick, talking }); render(); });
+  conn.on('data', d => {
+    if (!d) return;
+    if (d.t === 'meta') { p.nick = d.nick; p.talking = !!d.talking; }
+    else if (d.t === 'talk') p.talking = !!d.on;
+    else if (d.t === 'nick') p.nick = d.nick;
+    render();
+  });
+  conn.on('close', () => removePeer(conn.peer));
+  conn.on('error', () => removePeer(conn.peer));
+  setTimeout(() => { const q = peers.get(conn.peer); if (q && q.conn === conn && !conn.open) removePeer(conn.peer); }, 12000);
+}
+
+function setupCall(call) {
+  const p = getPeer(call.peer);
+  p.call = call;
+  call.on('stream', s => {
+    if (p.audio) return;
+    const a = document.createElement('audio');
+    a.autoplay = true; a.playsInline = true; a.srcObject = s; a.muted = spkMuted;
+    document.body.appendChild(a);
+    p.audio = a;
+    a.play().catch(() => {});
+  });
+  call.on('close', () => removePeer(call.peer));
+  call.on('error', () => removePeer(call.peer));
+}
+
+function removePeer(id) {
+  const p = peers.get(id);
+  if (!p) return;
+  peers.delete(id);
+  try { p.conn && p.conn.close(); } catch (e) {}
+  try { p.call && p.call.close(); } catch (e) {}
+  if (p.audio) { p.audio.srcObject = null; p.audio.remove(); }
+  render();
+}
+
+function broadcast(msg) {
+  peers.forEach(p => { if (p.conn && p.conn.open) p.conn.send(msg); });
+}
+
+// ===== PTT =====
+function setTalking(on) {
+  if (!localStream) return;
+  if (on && (micMuted || left)) return;
+  if (talking === on) return;
+  talking = on;
+  localStream.getAudioTracks()[0].enabled = on;
+  broadcast({ t: 'talk', on });
+  if (navigator.vibrate) navigator.vibrate(on ? 30 : 10);
+  render();
+}
+
+const ptt = $('ptt');
+ptt.addEventListener('pointerdown', e => { e.preventDefault(); try { ptt.setPointerCapture(e.pointerId); } catch (x) {} setTalking(true); });
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => ptt.addEventListener(ev, () => setTalking(false)));
+ptt.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('blur', () => setTalking(false));
+document.addEventListener('visibilitychange', () => { if (document.hidden) setTalking(false); });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !e.repeat && !left && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); setTalking(true); }
+});
+window.addEventListener('keyup', e => { if (e.code === 'Space') setTalking(false); });
+
+// ===== 버튼 =====
+$('micBtn').onclick = () => { micMuted = !micMuted; if (micMuted) setTalking(false); render(); };
+$('spkBtn').onclick = () => { spkMuted = !spkMuted; peers.forEach(p => { if (p.audio) p.audio.muted = spkMuted; }); render(); };
+$('editNick').onclick = () => {
+  const n = (prompt('닉네임 변경', me.nick) || '').trim().slice(0, 12);
+  if (!n) return;
+  me.nick = n;
+  try { localStorage.setItem('ptt-nick', n); } catch (e) {}
+  broadcast({ t: 'nick', nick: n });
+  render();
+};
+
+// ===== 화면 그리기 =====
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+function render() {
+  if (left) return;
+  // 연결 상태
+  let cls = '', tx = '';
+  if (!main || !main.open) { cls = main && main.disconnected ? 'bad' : ''; tx = main && main.disconnected ? '끊김 · 재연결 중' : '서버 연결 중…'; }
+  else if (dirConn || dirPeer) { cls = 'ok'; tx = '연결됨'; }
+  else { tx = '채널 찾는 중…'; }
+  $('dot').className = 'dot ' + cls;
+  $('statusTx').textContent = tx;
+
+  // 접속자 목록
+  const list = [{ nick: me.nick + ' (나)', talking, state: micMuted ? '마이크 꺼짐' : '' }];
+  peers.forEach(p => list.push({ nick: p.nick, talking: p.talking, state: p.conn && p.conn.open ? '' : '연결 중…' }));
+  $('count').textContent = list.length;
+  $('users').innerHTML = list.map(u =>
+    `<li class="${u.talking ? 'talk' : ''}"><span>${u.talking ? '🔴' : '🟢'}</span><span class="name">${esc(u.nick)}</span><span class="tag">${u.talking ? '말하는 중' : u.state}</span></li>`
+  ).join('');
+
+  // 현재 발언자
+  const talkers = list.filter(u => u.talking).map(u => u.nick);
+  $('talker').textContent = talkers.length ? '🎙 ' + talkers.join(', ') : '조용함';
+  $('talker').className = talkers.length ? 'on' : '';
+
+  // 버튼
+  ptt.disabled = micMuted || !main || !main.open;
+  ptt.classList.toggle('on', talking);
+  ptt.textContent = micMuted ? '마이크 꺼짐' : talking ? '말하는 중…' : '누르고 말하기';
+  $('micBtn').textContent = micMuted ? '🎤 마이크 꺼짐' : '🎤 마이크 켜짐';
+  $('micBtn').classList.toggle('active', micMuted);
+  $('spkBtn').textContent = spkMuted ? '🔇 스피커 꺼짐' : '🔊 스피커 켜짐';
+  $('spkBtn').classList.toggle('active', spkMuted);
+}
+</script>
+</body>
+</html>
